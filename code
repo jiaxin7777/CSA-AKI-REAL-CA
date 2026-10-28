@@ -1,0 +1,1201 @@
+import os
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
+import json
+import platform
+import random
+import copy
+import warnings
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence, pad_packed_sequence
+
+from sklearn.metrics import (
+    roc_auc_score, roc_curve, confusion_matrix, accuracy_score,
+    precision_score, recall_score, f1_score, balanced_accuracy_score,
+    brier_score_loss
+)
+from sklearn.calibration import calibration_curve
+from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+import xgboost as xgb
+import lightgbm as lgb
+import joblib
+
+warnings.filterwarnings('ignore', category=UserWarning)
+warnings.filterwarnings('ignore', category=FutureWarning)
+
+try:
+    from pytorch_lightning import seed_everything as _pl_seed_everything
+
+    def seed_everything(seed: int = 2023, workers: bool = False):
+        _pl_seed_everything(seed, workers=workers)
+except Exception: 
+    def seed_everything(seed: int = 2023, workers: bool = False):
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        os.environ['PYTHONHASHSEED'] = str(seed)
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+preprocessed_dir = r'C:/Users/Lenovo/Desktop/demo/26.10.17自己跑的模型/ready_data_iabp_261024'
+output_dir = os.path.join(BASE_DIR, '26.10.28aki_prediction_output_5foldCV_iabp')
+cv_dir = os.path.join(output_dir, 'cv_results')
+curve_dir = os.path.join(output_dir, 'model_curves_pdf')
+calibration_dir = os.path.join(output_dir, 'calibration_results')
+pred_dir = os.path.join(output_dir, 'predictions')
+model_dir = os.path.join(output_dir, 'saved_models')
+for _d in (output_dir, cv_dir, curve_dir, calibration_dir, pred_dir, model_dir):
+    os.makedirs(_d, exist_ok=True)
+
+TARGET_COL = 'label'
+ID_COL = 'patientunitstayid'
+TIME_COL = 'observationoffset'
+
+RUN_DEEP_MODELS = True      
+RUN_TRAD_MODELS = True      
+FAST_MODE = False           
+N_FOLDS = 5                 
+CV_SEED = 2023              
+N_BOOTSTRAP = 1000          
+
+CLASS_WEIGHT_MODE = 'patient_sqrt' 
+CLASS_WEIGHT_CAP = 10.0
+PATIENT_BALANCED_LOSS = True
+
+MAX_TOKENS_PER_BATCH = 16384
+MAX_BATCH_SIZE = 64
+
+CV_EPOCHS = {'REAL-CA': 18, 'LSTM': 12, 'MLP': 10}
+CV_PATIENCE = {'REAL-CA': 5, 'LSTM': 4, 'MLP': 3}
+FINAL_EPOCHS_CAP = {'REAL-CA': 35, 'LSTM': 20, 'MLP': 20} 
+if FAST_MODE:
+    CV_EPOCHS = {'REAL-CA': 10, 'LSTM': 7, 'MLP': 6}
+    CV_PATIENCE = {'REAL-CA': 3, 'LSTM': 3, 'MLP': 2}
+
+DYNAMIC_FEATURES = [
+    'heart_rate', 'sbp', 'dbp', 'resp_rate',
+    'temperature', 'spo2', 
+    'ptt', 'alt', 'albumin', 'alp', 'ast',
+    'bilirubin_total', 'bun',
+    'calcium', 'chloride',
+    'creatinine',
+    'ck_cpk', 'ck_mb', 'glucose', 'hemoglobin',
+    'hematocrit',
+    'bicarbonate',
+    'lactate', 'pco2', 'po2', 'fio2', 'platelet', 'potassium', 'total_protein',
+    'inr', 'pt', 'rbc', 'sodium', 'total_cholesterol', 'troponin_t',
+    'wbc', 'magnesium', 'phosphate','troponin_i',
+]
+STATIC_FEATURES = [
+    'age', 'gender_1', 'bmi', 'sofatotal','gcs',
+    'hypertension_1', 'hyperlipidemia_1', 'diabetes_1', 'atrial_fibrillation_1',
+    'myocardial_infarction_1', 'chronic_kidney_disease_1', 
+    'hepatic_disease_1', 'copd_1', 'Peripheral Vascular Disease_1',
+    'acei_1', 'arbs_1', 'nsaids_1','antibiotics_1', 
+    'surgery_type_2', 'surgery_type_3',
+    
+]
+ALL_RAW_FEATURES = DYNAMIC_FEATURES + STATIC_FEATURES
+N_DYNAMIC = len(DYNAMIC_FEATURES) 
+N_STATIC = len(STATIC_FEATURES)   
+STATIC_EMB_DIM = 64               
+
+TRAD_EXCLUDE_COLS = [
+    'patientunitstayid', 'observationoffset', 'aki_stage', 'label',
+    'diagnosis_time_min', 'unitdischargeoffset', 'hospitaldischargestatus',
+]
+
+DEEP_GRIDS = {
+    'LSTM': [
+        {'hidden_dim': 64,  'num_layers': 2, 'dropout': 0.3, 'lr': 4e-4},
+        {'hidden_dim': 128, 'num_layers': 2, 'dropout': 0.5, 'lr': 4e-4}, 
+        {'hidden_dim': 128, 'num_layers': 2, 'dropout': 0.3, 'lr': 8e-4},
+        {'hidden_dim': 64,  'num_layers': 2, 'dropout': 0.5, 'lr': 8e-4},
+        {'hidden_dim': 128, 'num_layers': 3, 'dropout': 0.3, 'lr': 4e-4},
+    ],
+    'MLP': [
+        {'hidden_dim': 64,  'num_layers': 3, 'dropout': 0.4, 'lr': 2e-3}, 
+        {'hidden_dim': 128, 'num_layers': 3, 'dropout': 0.5, 'lr': 1e-3},
+        {'hidden_dim': 64,  'num_layers': 2, 'dropout': 0.3, 'lr': 2e-3},
+        {'hidden_dim': 128, 'num_layers': 2, 'dropout': 0.3, 'lr': 1e-3},
+        {'hidden_dim': 64,  'num_layers': 3, 'dropout': 0.5, 'lr': 1e-3},
+    ],
+    'REAL-CA': [
+        {'hidden_dim': 256, 'num_layers': 2, 'dropout': 0.5, 'lr': 3e-4, 'num_heads': 4}, 
+        {'hidden_dim': 128, 'num_layers': 2, 'dropout': 0.3, 'lr': 3e-4, 'num_heads': 4},
+        {'hidden_dim': 128, 'num_layers': 2, 'dropout': 0.3, 'lr': 5e-4, 'num_heads': 8},
+        {'hidden_dim': 256, 'num_layers': 2, 'dropout': 0.3, 'lr': 3e-4, 'num_heads': 4},
+        {'hidden_dim': 128, 'num_layers': 2, 'dropout': 0.5, 'lr': 3e-4, 'num_heads': 4},
+        {'hidden_dim': 256, 'num_layers': 2, 'dropout': 0.3, 'lr': 5e-4, 'num_heads': 8},
+    ],
+}
+
+TRAD_GRIDS = {
+    'Logistic Regression': [
+        {'C': 0.01}, {'C': 0.1}, {'C': 1.0}, {'C': 10.0},
+    ],
+    'Random Forest': [
+        {'n_estimators': 100, 'max_depth': None},
+        {'n_estimators': 200, 'max_depth': None},
+        {'n_estimators': 200, 'max_depth': 12},
+        {'n_estimators': 300, 'max_depth': 12},
+        {'n_estimators': 300, 'max_depth': 20},
+    ],
+    'XGBoost': [
+        {'n_estimators': 100, 'max_depth': 3, 'learning_rate': 0.1},
+        {'n_estimators': 200, 'max_depth': 3, 'learning_rate': 0.1},
+        {'n_estimators': 100, 'max_depth': 6, 'learning_rate': 0.1},
+        {'n_estimators': 200, 'max_depth': 6, 'learning_rate': 0.1},
+        {'n_estimators': 300, 'max_depth': 3, 'learning_rate': 0.05},
+    ],
+    'LightGBM': [
+        {'n_estimators': 100, 'num_leaves': 31, 'learning_rate': 0.1},
+        {'n_estimators': 200, 'num_leaves': 31, 'learning_rate': 0.1},
+        {'n_estimators': 100, 'num_leaves': 63, 'learning_rate': 0.1},
+        {'n_estimators': 200, 'num_leaves': 63, 'learning_rate': 0.1},
+        {'n_estimators': 300, 'num_leaves': 31, 'learning_rate': 0.05},
+    ],
+}
+if FAST_MODE:
+    DEEP_GRIDS = {k: v[:2] for k, v in DEEP_GRIDS.items()}
+    TRAD_GRIDS = {k: v[:2] for k, v in TRAD_GRIDS.items()}
+
+plt.rcParams.update({
+    'font.family': ['sans-serif'],
+    'font.sans-serif': ['Microsoft YaHei', 'SimHei', 'Arial', 'DejaVu Sans'],
+    'axes.unicode_minus': False,
+    'font.size': 10,
+    'axes.titlesize': 14,
+    'axes.labelsize': 12,
+    'xtick.labelsize': 10,
+    'ytick.labelsize': 10,
+    'legend.fontsize': 10,
+    'figure.dpi': 300,
+    'savefig.dpi': 300
+})
+model_colors = {
+    'REAL-CA': 'red', 'LSTM': 'blue', 'MLP': 'green',
+    'Logistic Regression': 'purple', 'Random Forest': 'orange',
+    'XGBoost': 'brown', 'LightGBM': 'cyan'
+}
+
+def get_device(model_name: str) -> torch.device:
+    if model_name in {'REAL-CA', 'LSTM', 'MLP'}:
+        return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    return torch.device('cpu')
+
+def find_optimal_threshold(y_true, y_prob):
+    y_true = np.asarray(y_true)
+    y_prob = np.asarray(y_prob)
+    if np.unique(y_true).size < 2:
+        return {'Optimal Threshold': 0.5, 'Youden Index': 0.0,
+                'Sensitivity': 0.0, 'Specificity': 0.0}
+    fpr, tpr, thresholds = roc_curve(y_true, y_prob)
+    valid = thresholds <= 1.0
+    fpr, tpr, thresholds = fpr[valid], tpr[valid], thresholds[valid]
+    youden = tpr - fpr
+    best_idx = int(np.argmax(youden))
+    best_thr = float(thresholds[best_idx])
+    cm = confusion_matrix(y_true, (y_prob >= best_thr).astype(int), labels=[0, 1])
+    tn, fp, fn, tp = cm.ravel()
+    return {
+        'Optimal Threshold': best_thr,
+        'Youden Index': float(tpr[best_idx] - fpr[best_idx]),
+        'Sensitivity': float(tp / (tp + fn)) if (tp + fn) > 0 else 0.0,
+        'Specificity': float(tn / (tn + fp)) if (tn + fp) > 0 else 0.0,
+    }
+
+def calculate_ece(y_true, y_prob, n_bins=10):
+    bins = np.linspace(0, 1, n_bins + 1)
+    bin_indices = np.digitize(y_prob, bins, right=True) - 1
+    ece = 0.0
+    for i in range(n_bins):
+        mask = (bin_indices == i)
+        if np.sum(mask) == 0:
+            continue
+        prob_mean = np.mean(y_prob[mask])
+        true_mean = np.mean(y_true[mask])
+        bin_weight = np.sum(mask) / len(y_true)
+        ece += bin_weight * np.abs(prob_mean - true_mean)
+    return float(ece)
+
+def compute_roc_auc_ci(y_true, y_prob, pids, n_bootstraps=N_BOOTSTRAP, alpha=0.05, seed=CV_SEED):
+    y_true = np.asarray(y_true)
+    y_prob = np.asarray(y_prob)
+    pids = np.asarray(pids)
+    if pids.size != y_true.size:
+        uniq_ids = np.arange(y_true.size)
+        idx_by_pid = {i: np.array([i]) for i in uniq_ids}
+    else:
+        uniq_ids = np.unique(pids)
+        order = np.argsort(pids, kind='stable')
+        sorted_pids = pids[order]
+        lo = np.searchsorted(sorted_pids, uniq_ids, side='left')
+        hi = np.searchsorted(sorted_pids, uniq_ids, side='right')
+        idx_by_pid = {p: order[l:h] for p, l, h in zip(uniq_ids, lo, hi)}
+
+    rng = np.random.default_rng(seed)
+    aucs = []
+    for _ in range(n_bootstraps):
+        draw = rng.choice(uniq_ids, size=len(uniq_ids), replace=True)
+        idx = np.concatenate([idx_by_pid[p] for p in draw])
+        if np.unique(y_true[idx]).size < 2:
+            continue
+        aucs.append(roc_auc_score(y_true[idx], y_prob[idx]))
+    if not aucs:
+        return 0.0, 0.0
+    lower, upper = np.percentile(aucs, [100 * alpha / 2, 100 * (1 - alpha / 2)])
+    return float(lower), float(upper)
+
+def compute_class_weights(df, mode=CLASS_WEIGHT_MODE, cap=CLASS_WEIGHT_CAP):
+    pat_max = df.groupby(ID_COL)[TARGET_COL].max()
+    n_pos_pat = int((pat_max == 1).sum())
+    n_neg_pat = int((pat_max == 0).sum())
+    n_pos_tok = int((df[TARGET_COL] == 1).sum())
+    n_neg_tok = int((df[TARGET_COL] == 0).sum())
+
+    if mode == 'fixed':
+        w_pos = 1.8
+    elif mode == 'none':
+        w_pos = 1.0
+    elif mode == 'patient_sqrt':
+        w_pos = np.sqrt(n_neg_pat / n_pos_pat) if n_pos_pat > 0 else 1.0
+    elif mode == 'patient_full':
+        w_pos = n_neg_pat / n_pos_pat if n_pos_pat > 0 else 1.0
+    elif mode == 'timepoint_sqrt':
+        w_pos = np.sqrt(n_neg_tok / n_pos_tok) if n_pos_tok > 0 else 0.0
+    elif mode == 'timepoint_full':
+        w_pos = n_neg_tok / n_pos_tok if n_pos_tok > 0 else 1.0
+    else:
+        raise ValueError(f'未知 CLASS_WEIGHT_MODE: {mode}')
+
+    w_pos_raw = float(w_pos)
+    w_pos = float(min(w_pos, cap))
+    print(f'  [权重] 患者级 阳{n_pos_pat}/阴{n_neg_pat}；时点级 正{n_pos_tok}/负{n_neg_tok}；'
+          f'mode={mode} w_pos={w_pos_raw:.3f}'
+          + (f' -> 截断 {w_pos:.3f}' if w_pos != w_pos_raw else ''))
+    return np.array([1.0, w_pos], dtype=np.float64)
+
+def evaluate_predictions(y_true, y_prob, threshold, pids=None, dataset_name='',
+                         do_ci=True, ci_bootstraps=N_BOOTSTRAP):
+    y_true = np.asarray(y_true)
+    y_prob = np.asarray(y_prob)
+    y_pred = (y_prob >= threshold).astype(int)
+
+    if np.unique(y_true).size > 1:
+        auc = float(roc_auc_score(y_true, y_prob))
+        lower, upper = (compute_roc_auc_ci(y_true, y_prob, pids, n_bootstraps=ci_bootstraps)
+                        if do_ci and pids is not None else (0.0, 0.0))
+    else:
+        auc, lower, upper = 0.0, 0.0, 0.0
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    metrics = {
+        'Dataset': dataset_name,
+        'Threshold': threshold,
+        'Samples': int(len(y_true)),
+        'Positive': int(y_true.sum()),
+        'AUC': auc,
+        'AUC_95CI_lower': lower,
+        'AUC_95CI_upper': upper,
+        'Balanced_Acc': float(balanced_accuracy_score(y_true, y_pred)),
+        'F1': float(f1_score(y_true, y_pred, zero_division=0)),
+        'Accuracy': float(accuracy_score(y_true, y_pred)),
+        'Precision': float(precision_score(y_true, y_pred, zero_division=0)),
+        'Recall': float(recall_score(y_true, y_pred, zero_division=0)),
+        'Brier': float(brier_score_loss(y_true, y_prob)),
+        'ECE': float(calculate_ece(y_true, y_prob)),
+        'Confusion_Matrix_TN_FP_FN_TP': cm.ravel().tolist(),
+    }
+    return metrics
+
+def quick_auc_brier(y_true, y_prob):
+    y_true = np.asarray(y_true)
+    y_prob = np.asarray(y_prob)
+    auc = float(roc_auc_score(y_true, y_prob)) if np.unique(y_true).size > 1 else 0.0
+    brier = float(brier_score_loss(y_true, y_prob))
+    return auc, brier
+
+def delong_paired_test(y_true, prob_a, prob_b):
+    from scipy import stats
+    y_true = np.asarray(y_true)
+    pos = y_true == 1
+    neg = y_true == 0
+    n_pos, n_neg = int(pos.sum()), int(neg.sum())
+    if n_pos == 0 or n_neg == 0:
+        return None
+    pa, pb = np.asarray(prob_a), np.asarray(prob_b)
+    Xa, Ya = pa[pos], pa[neg]
+    Xb, Yb = pb[pos], pb[neg]
+
+    def _kernel(x_pos, y_neg):
+        diff = x_pos[:, None] - y_neg[None, :]
+        return (diff > 0).astype(float) + 0.5 * (diff == 0).astype(float)
+
+    A = _kernel(Xa, Ya)
+    B = _kernel(Xb, Yb)
+    auc_a, auc_b = float(A.mean()), float(B.mean())
+    v10 = np.vstack([A.mean(axis=1), B.mean(axis=1)]) 
+    v01 = np.vstack([A.mean(axis=0), B.mean(axis=0)]) 
+    s10 = np.cov(v10, ddof=1)
+    s01 = np.cov(v01, ddof=1)
+    cov = s10 / n_pos + s01 / n_neg
+    contrast = np.array([1.0, -1.0])
+    var = float(contrast @ cov @ contrast)
+    z = (auc_a - auc_b) / np.sqrt(max(var, 1e-12))
+    p_value = float(2.0 * stats.norm.sf(abs(z)))
+    return {'AUC_A': auc_a, 'AUC_B': auc_b, 'z': float(z), 'p_value': p_value}
+
+def save_prediction_df(df, model_name, tag):
+    path = os.path.join(pred_dir, f'{model_name}_{tag}_predictions.csv')
+    df.to_csv(path, index=False)
+    print(f'  ✅ 预测明细已保存: {path}')
+    return path
+
+def plot_roc_curves(plot_data, dataset_name, save_dir):
+    plt.figure(figsize=(10, 8))
+    for name, d in plot_data.items():
+        fpr, tpr, _ = roc_curve(d['true'], d['prob'])
+        label = f"{name} (AUC={d['auc']:.3f}"
+        if d.get('ci_lower') is not None:
+            label += f", 95% CI: [{d['ci_lower']:.3f}, {d['ci_upper']:.3f}]"
+        label += ')'
+        plt.plot(fpr, tpr, linewidth=2, color=model_colors.get(name, 'gray'), label=label)
+    plt.plot([0, 1], [0, 1], 'k--', linewidth=1.5, label='随机猜测')
+    plt.xlabel('1-特异度', fontweight='bold')
+    plt.ylabel('灵敏度', fontweight='bold')
+    plt.title(f'{dataset_name} ROC曲线', fontweight='bold', pad=20)
+    plt.xlim([-0.05, 1.05]); plt.ylim([-0.05, 1.05])
+    plt.legend(loc='lower right', frameon=True, fancybox=True, shadow=True, framealpha=0.6)
+    plt.grid(alpha=0.3)
+    path = os.path.join(save_dir, f'roc_curve_{dataset_name}.pdf')
+    plt.savefig(path, format='pdf', bbox_inches='tight'); plt.close()
+    print(f'  ✅ ROC 曲线已保存: {path}')
+
+def plot_calibration_curves(plot_data, dataset_name, save_dir, n_bins=10):
+    plt.figure(figsize=(10, 8))
+    for name, d in plot_data.items():
+        try:
+            prob_true, prob_pred = calibration_curve(d['true'], d['prob'], n_bins=n_bins)
+        except Exception:
+            continue
+        brier = brier_score_loss(d['true'], d['prob'])
+        plt.plot(prob_pred, prob_true, marker='o', linewidth=2, markersize=6,
+                 color=model_colors.get(name, 'gray'), label=f'{name} (Brier={brier:.3f})')
+    plt.plot([0, 1], [0, 1], 'k--', linewidth=1.5, label='完美校准')
+    plt.xlabel('平均预测概率', fontweight='bold')
+    plt.ylabel('实际阳性比例', fontweight='bold')
+    plt.title(f'{dataset_name} 校准曲线', fontweight='bold', pad=20)
+    plt.xlim([-0.05, 1.05]); plt.ylim([-0.05, 1.05])
+    plt.legend(loc='lower right', frameon=True, fancybox=True, shadow=True, framealpha=0.6)
+    plt.grid(alpha=0.3)
+    path = os.path.join(save_dir, f'calibration_curve_{dataset_name}.pdf')
+    plt.savefig(path, format='pdf', bbox_inches='tight'); plt.close()
+    print(f'  ✅ 校准曲线已保存: {path}')
+
+def plot_decision_curves(plot_data, dataset_name, save_dir):
+    plt.figure(figsize=(10, 8))
+    thresholds = np.arange(0.0, 1.01, 0.01)
+    ref = next(iter(plot_data.values()))
+    n_total = len(ref['true'])
+    for name, d in plot_data.items():
+        y_true, y_prob = d['true'], d['prob']
+        nb = []
+        for thr in thresholds:
+            tp = np.sum((y_true == 1) & (y_prob >= thr))
+            fp = np.sum((y_true == 0) & (y_prob >= thr))
+            nb.append(tp / n_total - (fp / n_total) * (thr / (1 - thr + 1e-6)))
+        plt.plot(thresholds, nb, linewidth=2, color=model_colors.get(name, 'gray'), label=name)
+    plt.axhline(y=0, color='grey', linestyle='--', linewidth=1.5, label='不干预')
+    all_nb = (np.sum(ref['true'] == 1) / n_total) - thresholds / (1 - thresholds + 1e-6) * (
+            np.sum(ref['true'] == 0) / n_total)
+    plt.plot(thresholds, all_nb, color='red', linestyle='--', linewidth=1.5, label='全部干预')
+    plt.xlabel('阈值概率', fontweight='bold')
+    plt.ylabel('净获益', fontweight='bold')
+    plt.title(f'{dataset_name} 决策曲线分析', fontweight='bold', pad=20)
+    plt.xlim([0, 1]); plt.ylim([-0.1, 0.5])
+    plt.legend(loc='lower right', frameon=True, fancybox=True, shadow=True, framealpha=0.7)
+    plt.grid(alpha=0.3)
+    path = os.path.join(save_dir, f'decision_curve_{dataset_name}.pdf')
+    plt.savefig(path, format='pdf', bbox_inches='tight'); plt.close()
+    print(f'  ✅ 决策曲线已保存: {path}')
+
+def plot_cv_auc_bars(cv_summary, save_dir):
+    best_rows = cv_summary.sort_values('mean_AUC', ascending=True)
+    plt.figure(figsize=(10, 7))
+    colors = [model_colors.get(n, 'gray') for n in best_rows['Model']]
+    plt.barh(best_rows['Model'], best_rows['mean_AUC'],
+             xerr=best_rows['std_AUC'], color=colors, alpha=0.8,
+             capsize=5, edgecolor='black', linewidth=0.6)
+    for i, (m, s) in enumerate(zip(best_rows['mean_AUC'], best_rows['std_AUC'])):
+        plt.text(m + s + 0.002, i, f'{m:.3f}±{s:.3f}', va='center', fontsize=10)
+    plt.xlabel('5 折交叉验证 AUC（均值 ± 标准差）', fontweight='bold')
+    plt.title('各模型最优超参数的交叉验证性能', fontweight='bold', pad=15)
+    plt.xlim(min(0.5, best_rows['mean_AUC'].min() - 0.05), 1.0)
+    plt.grid(axis='x', alpha=0.3)
+    plt.tight_layout()
+    path = os.path.join(save_dir, 'cv_auc_comparison.pdf')
+    plt.savefig(path, format='pdf', bbox_inches='tight')
+    plt.savefig(path.replace('.pdf', '.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f'  ✅ CV-AUC 对比图已保存: {path}')
+
+class AKIDataset(Dataset):
+    def __init__(self, dataframe):
+        required = [ID_COL, TIME_COL, TARGET_COL]
+        missing = [c for c in required if c not in dataframe.columns]
+        if missing:
+            raise ValueError(f'缺失必要列: {missing}')
+        self.feature_names = [c for c in ALL_RAW_FEATURES if c in dataframe.columns]
+        miss_feat = [c for c in ALL_RAW_FEATURES if c not in self.feature_names]
+        if miss_feat:
+            raise ValueError(f'缺失建模特征: {miss_feat}')
+        self.input_dim = len(self.feature_names)
+        self.patients = []
+        self.aki_positive_indices = []
+        self.aki_negative_indices = []
+
+        for idx, (pid, g) in enumerate(dataframe.groupby(ID_COL)):
+            g = g.sort_values(TIME_COL).reset_index(drop=True)
+            self.patients.append({
+                'features': g[self.feature_names].values.astype(np.float32),
+                'labels': g[TARGET_COL].values.astype(np.int64),
+                'seq_length': len(g),
+                'patient_id': pid,
+                'observationoffsets': g[TIME_COL].values.astype(np.int64),
+            })
+            if g[TARGET_COL].iloc[-1] == 1:
+                self.aki_positive_indices.append(idx)
+            else:
+                self.aki_negative_indices.append(idx)
+
+    def __len__(self):
+        return len(self.patients)
+
+    def __getitem__(self, idx):
+        p = self.patients[idx]
+        return (torch.FloatTensor(p['features']),
+                torch.tensor(p['labels'], dtype=torch.long),
+                p['seq_length'], p['patient_id'], p['observationoffsets'])
+
+    def get_feature_names(self):
+        return self.feature_names
+
+    def get_input_dim(self):
+        return self.input_dim
+
+def collate_fn(batch):
+    batch.sort(key=lambda x: (-x[2], x[3]))
+    sequences, labels, lengths, patient_ids, observationoffsets = zip(*batch)
+    padded_sequences = pad_sequence(sequences, batch_first=True)
+    padded_labels = pad_sequence([lab.unsqueeze(1) for lab in labels],
+                                 batch_first=True, padding_value=-100).squeeze(2)
+    return (padded_sequences, padded_labels, torch.tensor(lengths),
+            patient_ids, observationoffsets)
+
+class TokenBudgetBatchSampler(torch.utils.data.Sampler):
+
+    def __init__(self, lengths, max_tokens=MAX_TOKENS_PER_BATCH,
+                 max_batch_size=MAX_BATCH_SIZE, shuffle=True, seed=CV_SEED):
+        self.lengths = np.asarray(lengths, dtype=np.int64)
+        self.max_tokens = int(max_tokens)
+        self.max_batch_size = int(max_batch_size)
+        self.shuffle = shuffle
+        self.seed = seed
+        self._epoch = 0
+
+    def _build(self, epoch):
+        n = len(self.lengths)
+        rng = np.random.default_rng(self.seed + epoch)
+        idx = rng.permutation(n).astype(np.int64) if self.shuffle else np.arange(n, dtype=np.int64)
+        idx = idx[np.argsort(self.lengths[idx], kind='stable')]
+        batches, cur, cur_tok = [], [], 0
+        for i in idx:
+            L = int(self.lengths[i])
+            if cur and (cur_tok + L > self.max_tokens or len(cur) >= self.max_batch_size):
+                batches.append(cur)
+                cur, cur_tok = [], 0
+            cur.append(int(i)); cur_tok += L
+        if cur:
+            batches.append(cur)
+        if self.shuffle and len(batches) > 1:
+            order = rng.permutation(len(batches))
+            batches = [batches[k] for k in order]
+        return batches
+
+    def __iter__(self):
+        batches = self._build(self._epoch)
+        self._epoch += 1
+        yield from batches
+
+    def __len__(self):
+        return len(self._build(0))
+
+def make_loader(dataset, shuffle, num_workers=0):
+    sampler = TokenBudgetBatchSampler(
+        [p['seq_length'] for p in dataset.patients],
+        max_tokens=MAX_TOKENS_PER_BATCH, max_batch_size=MAX_BATCH_SIZE,
+        shuffle=shuffle, seed=CV_SEED)
+    return DataLoader(dataset, batch_sampler=sampler, collate_fn=collate_fn,
+                      num_workers=num_workers, pin_memory=True)
+
+class LSTMModel(nn.Module):
+    def __init__(self, input_dim, hidden_dim, num_layers, output_dim=2, dropout=0.5):
+        super().__init__()
+        self.lstm = nn.LSTM(input_size=input_dim, hidden_size=hidden_dim,
+                            num_layers=num_layers, batch_first=True, bidirectional=False,
+                            dropout=dropout if num_layers > 1 else 0)
+        self.dropout = nn.Dropout(dropout)
+        self.fc1 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, output_dim)
+        self.relu = nn.ReLU()
+
+    def forward(self, x, seq_lengths):
+        packed = pack_padded_sequence(x, seq_lengths.cpu().numpy(),
+                                      batch_first=True, enforce_sorted=False)
+        out, _ = self.lstm(packed)
+        lstm_out, _ = pad_packed_sequence(out, batch_first=True)
+        x = self.dropout(lstm_out)
+        x = self.relu(self.fc1(x))
+        return self.fc2(x), None
+
+class MLPModel(nn.Module):
+    def __init__(self, input_dim, hidden_dim, num_layers=2, output_dim=2, dropout=0.5):
+        super().__init__()
+        self.output_dim = output_dim
+        layers = []
+        prev = input_dim
+        for _ in range(num_layers):
+            layers.extend([nn.Linear(prev, hidden_dim), nn.BatchNorm1d(hidden_dim),
+                           nn.ReLU(), nn.Dropout(dropout)])
+            prev = hidden_dim
+        self.mlp = nn.Sequential(*layers)
+        self.fc_out = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x, seq_lengths):
+        B, T, D = x.shape
+        h = self.mlp(x.reshape(-1, D))
+        return self.fc_out(h).view(B, T, self.output_dim), None
+
+class MultiHeadSelfAttention(nn.Module):
+
+    def __init__(self, hidden_dim, num_heads=4):
+        super().__init__()
+        assert hidden_dim % num_heads == 0, 'hidden_dim 必须能被 num_heads 整除'
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+        self.query = nn.Linear(hidden_dim, hidden_dim)
+        self.key = nn.Linear(hidden_dim, hidden_dim)
+        self.value = nn.Linear(hidden_dim, hidden_dim)
+        self.out = nn.Linear(hidden_dim, hidden_dim)
+
+    def forward(self, x, lengths):
+        B, T, _ = x.shape
+        Q = self.query(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        K = self.key(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        V = self.value(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+
+        ar = torch.arange(T, device=x.device)
+        key_ok = ar.unsqueeze(0) < lengths.unsqueeze(1)         
+        causal = ar.unsqueeze(0) <= ar.unsqueeze(1)             
+        pad_q = ar.unsqueeze(0) >= lengths.unsqueeze(1)         
+        keep = key_ok.unsqueeze(1) & (causal.unsqueeze(0) | pad_q.unsqueeze(2))
+
+        context = F.scaled_dot_product_attention(Q, K, V, attn_mask=keep.unsqueeze(1), dropout_p=0.0)
+        context = context.transpose(1, 2).contiguous().view(B, T, self.hidden_dim)
+        return self.out(context), None
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+
+    def forward(self, x):
+        B, T, H = x.shape
+        position = torch.arange(T, device=x.device).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, H, 2, device=x.device) * (-np.log(10000.0) / H))
+        pe = torch.zeros(T, 1, H, device=x.device)
+        pe[:, 0, 0::2] = torch.sin(position * div_term)
+        pe[:, 0, 1::2] = torch.cos(position * div_term)
+        pe = pe.expand(-1, B, -1).transpose(0, 1)
+        return x + pe
+
+class AttentionLSTMModel(nn.Module):
+
+    def __init__(self, input_dim, hidden_dim, num_layers, output_dim=2, dropout=0.5,
+                 num_heads=4, static_dim=N_STATIC, static_emb_dim=STATIC_EMB_DIM):
+        super().__init__()
+        self.dynamic_dim = input_dim
+        self.static_dim = static_dim
+        self.lstm = nn.LSTM(input_size=input_dim, hidden_size=hidden_dim,
+                            num_layers=num_layers, batch_first=True, bidirectional=False,
+                            dropout=dropout if num_layers > 1 else 0)
+        self.proj = nn.Linear(hidden_dim, hidden_dim)
+        self.ln1 = nn.LayerNorm(hidden_dim)
+        self.pos_encoding = PositionalEncoding(hidden_dim)
+        self.attention = MultiHeadSelfAttention(hidden_dim=hidden_dim, num_heads=num_heads)
+        self.ln2 = nn.LayerNorm(hidden_dim)
+        self.static_mlp = nn.Sequential(
+            nn.Linear(static_dim, hidden_dim), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(hidden_dim, static_emb_dim), nn.ReLU()
+        )
+        self.dropout = nn.Dropout(dropout)
+        self.fc1 = nn.Linear(hidden_dim + static_emb_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, output_dim)
+        self.relu = nn.ReLU()
+
+    def forward(self, x, seq_lengths):
+        x_dyn = x[:, :, :self.dynamic_dim]
+        x_sta = x[:, :, self.dynamic_dim:self.dynamic_dim + self.static_dim]
+        packed = pack_padded_sequence(x_dyn, seq_lengths.cpu().numpy(),
+                                      batch_first=True, enforce_sorted=False)
+        out, _ = self.lstm(packed)
+        lstm_out, _ = pad_packed_sequence(out, batch_first=True)
+        h = self.ln1(lstm_out + self.proj(lstm_out))
+        h = self.pos_encoding(h)
+        attn_out, attn_weights = self.attention(h, seq_lengths)
+        h = self.ln2(h + attn_out)
+        s = self.static_mlp(x_sta[:, 0, :])
+        s = s.unsqueeze(1).expand(-1, h.size(1), -1)
+        merged = torch.cat([h, s], dim=-1)
+        z = self.dropout(merged)
+        z = self.relu(self.fc1(z))
+        logits = self.fc2(z)
+        return logits, attn_weights
+
+DEEP_MODEL_CLASSES = {'REAL-CA': AttentionLSTMModel, 'LSTM': LSTMModel, 'MLP': MLPModel}
+
+def build_deep_model(model_name, params, device):
+    cls = DEEP_MODEL_CLASSES[model_name]
+    if model_name == 'REAL-CA':
+        return cls(input_dim=params['input_dim'], hidden_dim=params['hidden_dim'],
+                   num_layers=params['num_layers'], output_dim=params['output_dim'],
+                   dropout=params['dropout'], num_heads=params.get('num_heads', 4),
+                   static_dim=params.get('static_dim', N_STATIC),
+                   static_emb_dim=params.get('static_emb_dim', STATIC_EMB_DIM)).to(device)
+    return cls(input_dim=params['input_dim'], hidden_dim=params['hidden_dim'],
+               num_layers=params['num_layers'], output_dim=params['output_dim'],
+               dropout=params['dropout']).to(device)
+
+def _tok_loss_safe(crit_tok, logits, labels):
+    orig_det = torch.are_deterministic_algorithms_enabled()
+    torch.use_deterministic_algorithms(False)
+    loss = crit_tok(logits.transpose(1, 2), labels)
+    torch.use_deterministic_algorithms(orig_det)
+    return loss
+
+def collect_deep_predictions(model, loader, device, class_weights):
+    model.eval()
+    crit_tok = nn.CrossEntropyLoss(
+        ignore_index=-100,
+        weight=torch.tensor(np.asarray(class_weights, dtype=np.float32), device=device),
+        reduction='none')
+    pids_out, offs_out, true_out, prob_out = [], [], [], []
+    loss_sum, weight_sum = 0.0, 0.0
+    with torch.no_grad():
+        for inputs, labels, lengths, patient_ids, observationoffsets in loader:
+            inputs, labels, lengths = inputs.to(device), labels.to(device), lengths.to(device)
+            logits, _ = model(inputs, lengths)
+            tok_loss = _tok_loss_safe(crit_tok, logits, labels)
+            valid = (labels != -100).float()
+            w = valid * (1.0 / lengths.float()).unsqueeze(1)
+            loss_sum += float((tok_loss * w).sum())
+            weight_sum += float(w.sum())
+
+            probs = torch.softmax(logits, dim=2)
+            ar = torch.arange(labels.shape[1], device=device).unsqueeze(0)
+            mask = (ar < lengths.unsqueeze(1)) & (labels != -100)
+            flat = mask.flatten()
+            prob_out.extend(probs[:, :, 1].flatten()[flat].cpu().numpy())
+            true_out.extend(labels.flatten()[flat].cpu().numpy())
+            for i, pid in enumerate(patient_ids):
+                L = lengths[i].item()
+                pids_out.extend([pid] * L)
+                offs_out.extend(observationoffsets[i][:L])
+    avg_loss = loss_sum / weight_sum if weight_sum > 0 else 0.0
+    return (np.array(pids_out), np.array(offs_out), np.array(true_out),
+            np.array(prob_out), avg_loss)
+
+def fit_deep_model(model_name, train_df, val_df, params, class_weights,
+                   max_epochs, patience, seed, num_workers, desc=''):
+    seed_everything(seed)
+    device = get_device(model_name)
+    train_ds = AKIDataset(train_df)
+    val_ds = AKIDataset(val_df) if val_df is not None else None
+    train_loader = make_loader(train_ds, shuffle=True, num_workers=num_workers)
+    val_loader = make_loader(val_ds, shuffle=False, num_workers=num_workers) if val_ds is not None else None
+
+    model = build_deep_model(model_name, params, device)
+    w = torch.tensor(np.asarray(class_weights, dtype=np.float32), device=device)
+    crit_tok = nn.CrossEntropyLoss(ignore_index=-100, weight=w, reduction='none').to(device)
+    optimizer = optim.Adam(model.parameters(), lr=params['lr'], weight_decay=1e-5)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(max_epochs, 1), eta_min=params['lr'] / 20)
+
+    best_auc, best_loss, best_epoch = -1.0, float('inf'), 0
+    best_state = None
+    stall = 0
+    history = []
+    for epoch in range(max_epochs):
+        model.train()
+        loss_sum, w_sum = 0.0, 0.0
+        bar = tqdm(train_loader, desc=f'{desc} ep{epoch + 1}/{max_epochs}', leave=False)
+        for inputs, labels, lengths, _, _ in bar:
+            inputs, labels, lengths = inputs.to(device), labels.to(device), lengths.to(device)
+            optimizer.zero_grad()
+            logits, _ = model(inputs, lengths)
+            tok_loss = _tok_loss_safe(crit_tok, logits, labels)
+            if PATIENT_BALANCED_LOSS:
+                valid = (labels != -100).float()
+                pw = (1.0 / lengths.float()).unsqueeze(1)
+                ww = valid * pw
+                loss = (tok_loss * ww).sum() / ww.sum().clamp(min=1e-8)
+            else:
+                loss = tok_loss.mean()
+            loss.backward()
+            optimizer.step()
+            loss_sum += float(loss.item())
+            w_sum += 1
+        train_loss = loss_sum / max(w_sum, 1)
+        scheduler.step()
+
+        if val_loader is not None:
+            vp, vo, vy, vprob, vloss = collect_deep_predictions(model, val_loader, device, class_weights)
+            v_auc, v_brier = quick_auc_brier(vy, vprob)
+            history.append({'epoch': epoch + 1, 'train_loss': train_loss,
+                            'val_loss': vloss, 'val_auc': v_auc, 'val_brier': v_brier})
+            better = (v_auc > best_auc + 1e-6) or \
+                     (abs(v_auc - best_auc) <= 1e-6 and vloss < best_loss)
+            if better:
+                best_auc, best_loss, best_epoch = v_auc, vloss, epoch + 1
+                best_state = copy.deepcopy(model.state_dict())
+                stall = 0
+            else:
+                stall += 1
+                if stall >= patience:
+                    break
+        else:
+            history.append({'epoch': epoch + 1, 'train_loss': train_loss})
+            best_state = copy.deepcopy(model.state_dict())
+            best_epoch = epoch + 1
+
+    if best_state is None: 
+        best_state = copy.deepcopy(model.state_dict())
+        best_epoch = max_epochs
+    model.load_state_dict(best_state)
+    val_pred = None
+    if val_loader is not None:
+        vp, vo, vy, vprob, _ = collect_deep_predictions(model, val_loader, device, class_weights)
+        val_pred = (vp, vo, vy, vprob)
+    return {'model': model, 'best_state': best_state, 'best_epoch': best_epoch,
+            'best_val_auc': best_auc, 'history': history, 'device': device,
+            'val_pred': val_pred}
+
+def predict_deep(model, df, class_weights, num_workers):
+    device = next(model.parameters()).device
+    ds = AKIDataset(df)
+    loader = make_loader(ds, shuffle=False, num_workers=num_workers)
+    pids, offs, true, prob, avg_loss = collect_deep_predictions(model, loader, device, class_weights)
+    return pd.DataFrame({ID_COL: pids, TIME_COL: offs, 'true_label': true, 'pred_prob': prob}), avg_loss
+
+def make_patient_folds(dev_df, n_folds=N_FOLDS, seed=CV_SEED):
+    pat = dev_df.groupby(ID_COL)[TARGET_COL].max().rename('pat_label').reset_index()
+    sgkf = StratifiedGroupKFold(n_splits=n_folds, shuffle=True, random_state=seed)
+    folds = []
+    for tr_idx, va_idx in sgkf.split(pat[[ID_COL]], pat['pat_label'], groups=pat[ID_COL]):
+        folds.append((set(pat.iloc[tr_idx][ID_COL].values),
+                      set(pat.iloc[va_idx][ID_COL].values)))
+    print(f'✅ 已生成 {n_folds} 折患者级划分（StratifiedGroupKFold，按患者阳性分层）')
+    for i, (tr, va) in enumerate(folds):
+        print(f'   fold{i + 1}: 训练患者 {len(tr)}，留出患者 {len(va)}')
+    return folds
+
+def run_deep_cv(model_name, dev_df, folds, feature_dim, class_weights_full, num_workers):
+    grid = DEEP_GRIDS[model_name]
+    max_epochs = CV_EPOCHS[model_name]
+    patience = CV_PATIENCE[model_name]
+    rows = []
+    cfg_results = []
+    oof_store = {} 
+
+    for ci, cfg in enumerate(grid):
+        cfg = dict(cfg)
+        if model_name == 'REAL-CA':
+            cfg.update({'input_dim': N_DYNAMIC, 'static_dim': N_STATIC,
+                        'static_emb_dim': STATIC_EMB_DIM, 'output_dim': 2})
+        else:
+            cfg.update({'input_dim': len(ALL_RAW_FEATURES), 'output_dim': 2})
+        fold_aucs, fold_briers, fold_epochs = [], [], []
+        oof_parts = []
+        for fi, (tr_pids, va_pids) in enumerate(folds):
+            print(f'\n--- [{model_name}] 配置{ci + 1}/{len(grid)} {cfg} | fold {fi + 1}/{N_FOLDS} ---')
+            tr_df = dev_df[dev_df[ID_COL].isin(tr_pids)]
+            va_df = dev_df[dev_df[ID_COL].isin(va_pids)]
+            cw = compute_class_weights(tr_df)
+            seed = CV_SEED + ci * 100 + fi
+            fit = fit_deep_model(model_name, tr_df, va_df, cfg, cw,
+                                 max_epochs=max_epochs, patience=patience,
+                                 seed=seed, num_workers=num_workers,
+                                 desc=f'{model_name}-c{ci + 1}-f{fi + 1}')
+            vp, vo, vy, vprob = fit['val_pred']
+            auc, brier = quick_auc_brier(vy, vprob)
+            fold_aucs.append(auc); fold_briers.append(brier); fold_epochs.append(fit['best_epoch'])
+            oof_parts.append(pd.DataFrame({ID_COL: vp, TIME_COL: vo,
+                                           'true_label': vy, 'pred_prob': vprob}))
+            rows.append({'Model': model_name, 'config_id': ci + 1, 'params': json.dumps(cfg, ensure_ascii=False),
+                         'fold': fi + 1, 'AUC': auc, 'Brier': brier, 'best_epoch': fit['best_epoch']})
+            print(f'   fold{fi + 1} AUC={auc:.4f} Brier={brier:.4f} best_epoch={fit["best_epoch"]}')
+        oof_store[ci + 1] = oof_parts
+        cfg_results.append({
+            'config_id': ci + 1, 'params': cfg,
+            'mean_AUC': float(np.mean(fold_aucs)), 'std_AUC': float(np.std(fold_aucs, ddof=0)),
+            'mean_Brier': float(np.mean(fold_briers)),
+            'median_best_epoch': int(np.ceil(np.median(fold_epochs))),
+        })
+        print(f'>>> [{model_name}] 配置{ci + 1} 5折 AUC={np.mean(fold_aucs):.4f}±{np.std(fold_aucs):.4f}')
+
+    cfg_results.sort(key=lambda r: (-r['mean_AUC'], r['std_AUC'], r['mean_Brier']))
+    best = cfg_results[0]
+    print(f'🏆 [{model_name}] 最优配置: {best["params"]} '
+          f'(CV AUC={best["mean_AUC"]:.4f}±{best["std_AUC"]:.4f}, 中位数best_epoch={best["median_best_epoch"]})')
+
+    oof_df = pd.concat(oof_store[best['config_id']], ignore_index=True)
+    best_cfg = dict(best['params'])
+
+    final_epochs = int(min(best['median_best_epoch'], FINAL_EPOCHS_CAP[model_name]))
+    print(f'\n=== [{model_name}] 全开发集重训，固定 {final_epochs} 轮（CV 中位数 best_epoch，封顶 {FINAL_EPOCHS_CAP[model_name]}）===')
+    final_fit = fit_deep_model(model_name, dev_df, None, best_cfg, class_weights_full,
+                               max_epochs=final_epochs, patience=final_epochs,
+                               seed=CV_SEED + 1000, num_workers=num_workers,
+                               desc=f'{model_name}-final')
+    torch.save({'model_state_dict': final_fit['best_state'],
+                'hyperparameters': best_cfg, 'feature_names': ALL_RAW_FEATURES,
+                'final_epochs': final_epochs, 'cv_auc_mean': best['mean_AUC'],
+                'cv_auc_std': best['std_AUC'],
+                'save_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')},
+               os.path.join(model_dir, f'best_{model_name}_model.pth'))
+
+    return {'cv_rows': rows, 'all_configs': cfg_results, 'best': best,
+            'oof_df': oof_df, 'final_model': final_fit['model']}
+
+def get_traditional_feature_cols(df):
+    cols = [c for c in df.columns if c not in TRAD_EXCLUDE_COLS]
+    cols = [c for c in cols if pd.api.types.is_numeric_dtype(df[c])]
+    return cols
+
+def make_traditional_estimator(name, cfg, w_pos):
+    cw = None if abs(w_pos - 1.0) < 1e-8 else {0: 1.0, 1: w_pos}
+    if name == 'Logistic Regression':
+        return LogisticRegression(C=cfg['C'], max_iter=2000, solver='lbfgs',
+                                  class_weight=cw, random_state=CV_SEED)
+    if name == 'Random Forest':
+        return RandomForestClassifier(n_estimators=cfg['n_estimators'], max_depth=cfg['max_depth'],
+                                      class_weight=cw, random_state=CV_SEED, n_jobs=-1)
+    if name == 'XGBoost':
+        return xgb.XGBClassifier(n_estimators=cfg['n_estimators'], max_depth=cfg['max_depth'],
+                                 learning_rate=cfg.get('learning_rate', 0.1),
+                                 random_state=CV_SEED, eval_metric='logloss',
+                                 scale_pos_weight=w_pos, n_jobs=-1)
+    if name == 'LightGBM':
+        return lgb.LGBMClassifier(n_estimators=cfg['n_estimators'], num_leaves=cfg['num_leaves'],
+                                  learning_rate=cfg.get('learning_rate', 0.1),
+                                  random_state=CV_SEED, class_weight=cw, n_jobs=-1, verbose=-1)
+    raise ValueError(f'未知传统模型: {name}')
+
+def run_traditional_cv(model_name, train_df, internal_df, external_df, folds,
+                       feature_cols, class_weights_full):
+    grid = TRAD_GRIDS[model_name]
+    w_pos_full = float(class_weights_full[1])
+    X_tr = train_df[feature_cols].values
+    y_tr = train_df[TARGET_COL].values
+    pids_tr = train_df[ID_COL].values
+
+    fold_masks, fold_weights = [], []
+    for tr_pids, va_pids in folds:
+        tr_mask = np.fromiter((p in tr_pids for p in pids_tr), dtype=bool, count=len(pids_tr))
+        va_mask = ~tr_mask
+        cw = compute_class_weights(train_df[tr_mask])
+        fold_masks.append((tr_mask, va_mask))
+        fold_weights.append(float(cw[1]))
+
+    rows = []
+    cfg_results = []
+    oof_store = {} 
+
+    for ci, cfg in enumerate(grid):
+        fold_aucs, fold_briers = [], []
+        oof_prob = np.full(len(train_df), np.nan)
+        for fi, ((tr_mask, va_mask), w_pos) in enumerate(zip(fold_masks, fold_weights)):
+            print(f'\n--- [{model_name}] 配置{ci + 1}/{len(grid)} {cfg} | fold {fi + 1}/{N_FOLDS} ---')
+            est = make_traditional_estimator(model_name, cfg, w_pos)
+            est.fit(X_tr[tr_mask], y_tr[tr_mask])
+            vprob = est.predict_proba(X_tr[va_mask])[:, 1]
+            oof_prob[va_mask] = vprob
+            vy = y_tr[va_mask]
+            auc, brier = quick_auc_brier(vy, vprob)
+            fold_aucs.append(auc); fold_briers.append(brier)
+            rows.append({'Model': model_name, 'config_id': ci + 1,
+                         'params': json.dumps(cfg, ensure_ascii=False), 'fold': fi + 1,
+                         'AUC': auc, 'Brier': brier, 'best_epoch': ''})
+            print(f'   fold{fi + 1} AUC={auc:.4f} Brier={brier:.4f}')
+        oof_store[ci + 1] = oof_prob
+        cfg_results.append({'config_id': ci + 1, 'params': dict(cfg),
+                            'mean_AUC': float(np.mean(fold_aucs)),
+                            'std_AUC': float(np.std(fold_aucs, ddof=0)),
+                            'mean_Brier': float(np.mean(fold_briers)),
+                            'median_best_epoch': ''})
+        print(f'>>> [{model_name}] 配置{ci + 1} 5折 AUC={np.mean(fold_aucs):.4f}±{np.std(fold_aucs):.4f}')
+
+    cfg_results.sort(key=lambda r: (-r['mean_AUC'], r['std_AUC'], r['mean_Brier']))
+    best = cfg_results[0]
+    print(f'🏆 [{model_name}] 最优配置: {best["params"]} '
+          f'(CV AUC={best["mean_AUC"]:.4f}±{best["std_AUC"]:.4f})')
+
+    best_cfg = dict(best['params'])
+    oof_df = pd.DataFrame({ID_COL: pids_tr, TIME_COL: train_df[TIME_COL].values,
+                           'true_label': y_tr, 'pred_prob': oof_store[best['config_id']]})
+
+    print(f'\n=== [{model_name}] 全训练集重训 ===')
+    final_est = make_traditional_estimator(model_name, best_cfg, w_pos_full)
+    final_est.fit(X_tr, y_tr)
+    joblib.dump({'model': final_est, 'params': best_cfg, 'feature_cols': feature_cols,
+                 'cv_auc_mean': best['mean_AUC'], 'cv_auc_std': best['std_AUC'],
+                 'save_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')},
+                os.path.join(model_dir, f'best_{model_name}_model.pkl'))
+
+    def _to_pred(df):
+        prob = final_est.predict_proba(df[feature_cols].values)[:, 1]
+        return pd.DataFrame({ID_COL: df[ID_COL].values, TIME_COL: df[TIME_COL].values,
+                             'true_label': df[TARGET_COL].values, 'pred_prob': prob})
+
+    internal_pred = _to_pred(internal_df)
+    external_pred = _to_pred(external_df)
+    return {'cv_rows': rows, 'all_configs': cfg_results, 'best': best,
+            'oof_df': oof_df, 'internal_df': internal_pred,
+            'external_df': external_pred, 'final_model': final_est}
+
+def main():
+    t0 = datetime.now()
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    try:
+        torch.use_deterministic_algorithms(True)
+    except Exception as e:
+        print(f'⚠️ 无法开启确定性算法: {e}')
+    seed_everything(CV_SEED, workers=True)
+    num_workers = 0 if platform.system() == 'Windows' else 4
+
+    print(f'\n======== REAL-CA 五折交叉验证版（对齐论文） 开始于 {t0:%Y-%m-%d %H:%M:%S} ========')
+    print(f'输出目录: {output_dir}')
+
+    print('\n===== 加载数据 =====')
+    train_df = pd.read_csv(os.path.join(preprocessed_dir, 'train_ready.csv'))
+    internal_df = pd.read_csv(os.path.join(preprocessed_dir, 'val_ready.csv'))
+    external_df = pd.read_csv(os.path.join(preprocessed_dir, 'test_ready.csv'))
+    print(f'✅ train={train_df.shape}, internal={internal_df.shape}, external={external_df.shape}')
+
+    def clean_label(v):
+        return 1 if v in [1, 2, 3] else 0
+    for df in (train_df, internal_df, external_df):
+        df[TARGET_COL] = df[TARGET_COL].apply(clean_label)
+    print(f'   患者数: train={train_df[ID_COL].nunique()}, '
+          f'internal={internal_df[ID_COL].nunique()}, external={external_df[ID_COL].nunique()}')
+
+    trad_feature_cols = get_traditional_feature_cols(train_df)
+    fill_cols = sorted((set(ALL_RAW_FEATURES) | set(trad_feature_cols))
+                       & set(train_df.columns) & set(internal_df.columns) & set(external_df.columns))
+    for df_name, df in [('train', train_df), ('internal', internal_df), ('external', external_df)]:
+        nan_cnt = df[fill_cols].isna().sum()
+        nan_cnt = nan_cnt[nan_cnt > 0]
+        if len(nan_cnt) > 0:
+            print(f'⚠️ {df_name} 有 {len(nan_cnt)} 个建模特征含 NaN，统一填 0: {dict(list(nan_cnt.items())[:8])}')
+            df[fill_cols] = df[fill_cols].fillna(0.0)
+    print(f'✅ 深度模型 {len(ALL_RAW_FEATURES)} 维（{N_DYNAMIC} 动态+{N_STATIC} 静态）；传统模型 {len(trad_feature_cols)} 列')
+
+    class_weights_full = compute_class_weights(train_df)
+    print(f'   全训练集权重: {class_weights_full}')
+
+    folds = make_patient_folds(train_df, N_FOLDS, CV_SEED)
+
+    all_cv_rows = []
+    all_best = []
+    results = {} 
+
+    if RUN_DEEP_MODELS:
+        for model_name in ['REAL-CA', 'LSTM', 'MLP']:
+            print(f'\n\n########## 深度模型 5 折 CV: {model_name} ##########')
+            res = run_deep_cv(model_name, train_df, folds, None,
+                              class_weights_full, num_workers)
+            results[model_name] = res
+            all_cv_rows.extend(res['cv_rows'])
+            all_best.append({'Model': model_name, **{k: v for k, v in res['best'].items() if k != 'params'},
+                             'params': json.dumps(res['best']['params'], ensure_ascii=False)})
+
+    if RUN_TRAD_MODELS:
+        for model_name in ['Logistic Regression', 'Random Forest', 'XGBoost', 'LightGBM']:
+            print(f'\n\n########## 传统模型 5 折 CV: {model_name} ##########')
+            res = run_traditional_cv(model_name, train_df, internal_df, external_df,
+                                     folds, trad_feature_cols, class_weights_full)
+            results[model_name] = res
+            all_cv_rows.extend(res['cv_rows'])
+            all_best.append({'Model': model_name, **{k: v for k, v in res['best'].items() if k != 'params'},
+                             'params': json.dumps(res['best']['params'], ensure_ascii=False)})
+
+    cv_detail = pd.DataFrame(all_cv_rows)
+    cv_detail_path = os.path.join(cv_dir, 'cv_fold_detail.csv')
+    cv_detail.to_csv(cv_detail_path, index=False)
+    print(f'\n✅ CV 折明细已保存: {cv_detail_path}')
+
+    best_df = pd.DataFrame(all_best)
+    best_df_path = os.path.join(cv_dir, 'cv_best_hyperparams.csv')
+    best_df.to_csv(best_df_path, index=False)
+    print(f'✅ 最优超参数已保存: {best_df_path}')
+    best_json = {r['Model']: {k: (v if not isinstance(v, np.generic) else v.item())
+                              for k, v in json.loads(r['params']).items()}
+                 for r in all_best}
+    with open(os.path.join(cv_dir, 'best_hyperparams.json'), 'w', encoding='utf-8') as f:
+        json.dump(best_json, f, ensure_ascii=False, indent=2)
+
+    if RUN_DEEP_MODELS:
+        for model_name in ['REAL-CA', 'LSTM', 'MLP']:
+            print(f'\n--- {model_name} 内部测试集预测（全训练集重训模型）---')
+            internal_pred, _ = predict_deep(results[model_name]['final_model'], internal_df,
+                                            class_weights_full, num_workers)
+            results[model_name]['internal_df'] = internal_pred
+            print(f'--- {model_name} 外部测试集预测 ---')
+            external_pred, _ = predict_deep(results[model_name]['final_model'], external_df,
+                                            class_weights_full, num_workers)
+            results[model_name]['external_df'] = external_pred
+
+    print('\n===== 训练集 OOF 约登阈值与最终评估 =====')
+    comparison_rows, comparison_rows_50 = [], []
+    plot_oof, plot_internal, plot_external = {}, {}, {}
+    thresholds_json = {}
+
+    def _eval_set(df, tag, thr, do_ci):
+        return evaluate_predictions(df['true_label'].values, df['pred_prob'].values, thr,
+                                    pids=df[ID_COL].values, dataset_name=tag, do_ci=do_ci)
+
+    for model_name, res in results.items():
+        oof = res['oof_df'].copy()
+        internal = res['internal_df'].copy()
+        external = res['external_df'].copy()
+        youden = find_optimal_threshold(oof['true_label'].values, oof['pred_prob'].values)
+        thr = youden['Optimal Threshold']
+        thresholds_json[model_name] = youden
+        print(f'\n[{model_name}] OOF 约登阈值={thr:.4f}（J={youden["Youden Index"]:.4f}，'
+              f'Sens={youden["Sensitivity"]:.4f}, Spec={youden["Specificity"]:.4f}）')
+
+        save_prediction_df(oof, model_name, 'oof_train')
+        save_prediction_df(internal, model_name, 'internal_test')
+        save_prediction_df(external, model_name, 'external_test')
+
+        m_oof = _eval_set(oof, 'OOF训练集(5折CV)', thr, do_ci=False)
+        m_int = _eval_set(internal, '内部测试集', thr, do_ci=True)
+        m_ext = _eval_set(external, '外部测试集', thr, do_ci=True)
+        m_oof50 = _eval_set(oof, 'OOF训练集(5折CV)', 0.5, do_ci=False)
+        m_int50 = _eval_set(internal, '内部测试集', 0.5, do_ci=False)
+        m_ext50 = _eval_set(external, '外部测试集', 0.5, do_ci=False)
+        for m in (m_oof, m_int, m_ext):
+            m['Model'] = model_name
+            m['CV_mean_AUC'] = float(res['best']['mean_AUC'])
+            m['CV_std_AUC'] = float(res['best']['std_AUC'])
+            comparison_rows.append(m)
+        for m in (m_oof50, m_int50, m_ext50):
+            m['Model'] = model_name
+            comparison_rows_50.append(m)
+
+        plot_oof[model_name] = {'true': oof['true_label'].values, 'prob': oof['pred_prob'].values,
+                                'auc': m_oof['AUC']}
+        plot_internal[model_name] = {'true': internal['true_label'].values, 'prob': internal['pred_prob'].values,
+                                     'auc': m_int['AUC'], 'ci_lower': m_int['AUC_95CI_lower'],
+                                     'ci_upper': m_int['AUC_95CI_upper']}
+        plot_external[model_name] = {'true': external['true_label'].values, 'prob': external['pred_prob'].values,
+                                     'auc': m_ext['AUC'], 'ci_lower': m_ext['AUC_95CI_lower'],
+                                     'ci_upper': m_ext['AUC_95CI_upper']}
+
+    with open(os.path.join(cv_dir, 'oof_youden_thresholds.json'), 'w', encoding='utf-8') as f:
+        json.dump(thresholds_json, f, ensure_ascii=False, indent=2)
+
+    comp_path = os.path.join(output_dir, 'all_models_comparison.csv')
+    pd.DataFrame(comparison_rows).to_csv(comp_path, index=False)
+    print(f'\n✅ 模型对比结果（OOF 约登阈值）已保存: {comp_path}')
+    comp50_path = os.path.join(output_dir, 'all_models_comparison_thr0.5.csv')
+    pd.DataFrame(comparison_rows_50).to_csv(comp50_path, index=False)
+    print(f'✅ 模型对比结果（阈值 0.5 附表）已保存: {comp50_path}')
+
+    print('\n===== 配对 DeLong 检验（REAL-CA vs 各模型）=====')
+    delong_rows = []
+    real_int = results['REAL-CA']['internal_df']
+    real_ext = results['REAL-CA']['external_df']
+    for model_name in ['LSTM', 'MLP', 'Logistic Regression', 'Random Forest', 'XGBoost', 'LightGBM']:
+        for cohort, real_df in [('internal', real_int), ('external', real_ext)]:
+            other_df = results[model_name][f'{cohort}_df']
+            r = delong_paired_test(real_df['true_label'].values,
+                                   real_df['pred_prob'].values,
+                                   other_df['pred_prob'].values)
+            if r is not None:
+                delong_rows.append({'Cohort': cohort, 'Comparator': model_name,
+                                    'AUC_REAL-CA': r['AUC_A'], 'AUC_Comparator': r['AUC_B'],
+                                    'z': r['z'], 'p_value': r['p_value'],
+                                    'p<0.05': r['p_value'] < 0.05})
+                print(f'  [{cohort}] REAL-CA vs {model_name}: '
+                      f'{r["AUC_A"]:.3f} vs {r["AUC_B"]:.3f}, z={r["z"]:.2f}, p={r["p_value"]:.4f}')
+    delong_path = os.path.join(cv_dir, 'delong_REAL-CA_vs_comparators.csv')
+    pd.DataFrame(delong_rows).to_csv(delong_path, index=False)
+    print(f'✅ DeLong 检验结果已保存: {delong_path}')
+
+    print('\n===== 绘制曲线 =====')
+    for pdata, dname in [(plot_oof, 'OOF训练集（五折交叉验证）'),
+                         (plot_internal, '内部测试集'),
+                         (plot_external, '外部测试集')]:
+        plot_roc_curves(pdata, dname, curve_dir)
+        plot_calibration_curves(pdata, dname, calibration_dir)
+        plot_decision_curves(pdata, dname, curve_dir)
+    plot_cv_auc_bars(best_df, cv_dir)
+
+    env_info = {
+        'run_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'started_at': t0.strftime('%Y-%m-%d %H:%M:%S'),
+        'python': platform.python_version(),
+        'pytorch': torch.__version__,
+        'cuda_available': torch.cuda.is_available(),
+        'sklearn': __import__('sklearn').__version__,
+        'xgboost': xgb.__version__,
+        'lightgbm': lgb.__version__,
+        'pandas': pd.__version__,
+        'numpy': np.__version__,
+        'n_folds': N_FOLDS,
+        'fold_strategy': 'StratifiedGroupKFold on training set (group=patientunitstayid, stratify=patient-level max(label))',
+        'fast_mode': FAST_MODE,
+        'threshold_rule': 'Youden index on pooled training-set OOF predictions; fixed for internal/external; thr=0.5 table attached',
+        'class_weight_mode': CLASS_WEIGHT_MODE,
+        'patient_balanced_loss': PATIENT_BALANCED_LOSS,
+        'deep_features': f'{len(ALL_RAW_FEATURES)} ({N_DYNAMIC} dynamic + {N_STATIC} static)',
+        'traditional_features': len(trad_feature_cols),
+        'n_bootstrap_ci': N_BOOTSTRAP,
+        'delong_test': 'paired DeLong, REAL-CA vs each comparator on internal/external',
+        'data_dir': preprocessed_dir,
+        'best_hyperparams': best_json,
+    }
+    with open(os.path.join(output_dir, 'environment_info.json'), 'w', encoding='utf-8') as f:
+        json.dump(env_info, f, ensure_ascii=False, indent=2)
+
+    print(f'\n======== 全部完成，用时 {datetime.now() - t0}，结束于 {datetime.now():%Y-%m-%d %H:%M:%S} ========')
+
+if __name__ == '__main__':
+    main()
