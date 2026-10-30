@@ -107,7 +107,6 @@ STATIC_FEATURES = [
     'hepatic_disease_1', 'copd_1', 'Peripheral Vascular Disease_1',
     'acei_1', 'arbs_1', 'nsaids_1','antibiotics_1', 
     'surgery_type_2', 'surgery_type_3',
-    
 ]
 ALL_RAW_FEATURES = DYNAMIC_FEATURES + STATIC_FEATURES
 N_DYNAMIC = len(DYNAMIC_FEATURES) 
@@ -119,60 +118,18 @@ TRAD_EXCLUDE_COLS = [
     'diagnosis_time_min', 'unitdischargeoffset', 'hospitaldischargestatus',
 ]
 
-DEEP_GRIDS = {
-    'LSTM': [
-        {'hidden_dim': 64,  'num_layers': 2, 'dropout': 0.3, 'lr': 4e-4},
-        {'hidden_dim': 128, 'num_layers': 2, 'dropout': 0.5, 'lr': 4e-4}, 
-        {'hidden_dim': 128, 'num_layers': 2, 'dropout': 0.3, 'lr': 8e-4},
-        {'hidden_dim': 64,  'num_layers': 2, 'dropout': 0.5, 'lr': 8e-4},
-        {'hidden_dim': 128, 'num_layers': 3, 'dropout': 0.3, 'lr': 4e-4},
-    ],
-    'MLP': [
-        {'hidden_dim': 64,  'num_layers': 3, 'dropout': 0.4, 'lr': 2e-3}, 
-        {'hidden_dim': 128, 'num_layers': 3, 'dropout': 0.5, 'lr': 1e-3},
-        {'hidden_dim': 64,  'num_layers': 2, 'dropout': 0.3, 'lr': 2e-3},
-        {'hidden_dim': 128, 'num_layers': 2, 'dropout': 0.3, 'lr': 1e-3},
-        {'hidden_dim': 64,  'num_layers': 3, 'dropout': 0.5, 'lr': 1e-3},
-    ],
-    'REAL-CA': [
-        {'hidden_dim': 256, 'num_layers': 2, 'dropout': 0.5, 'lr': 3e-4, 'num_heads': 4}, 
-        {'hidden_dim': 128, 'num_layers': 2, 'dropout': 0.3, 'lr': 3e-4, 'num_heads': 4},
-        {'hidden_dim': 128, 'num_layers': 2, 'dropout': 0.3, 'lr': 5e-4, 'num_heads': 8},
-        {'hidden_dim': 256, 'num_layers': 2, 'dropout': 0.3, 'lr': 3e-4, 'num_heads': 4},
-        {'hidden_dim': 128, 'num_layers': 2, 'dropout': 0.5, 'lr': 3e-4, 'num_heads': 4},
-        {'hidden_dim': 256, 'num_layers': 2, 'dropout': 0.3, 'lr': 5e-4, 'num_heads': 8},
-    ],
+DEEP_FIXED_PARAMS = {
+    'REAL-CA': {'hidden_dim': 256, 'num_layers': 2, 'dropout': 0.5, 'lr': 3e-4, 'num_heads': 4},
+    'LSTM': {'hidden_dim': 128, 'num_layers': 2, 'dropout': 0.5, 'lr': 4e-4},
+    'MLP': {'hidden_dim': 64, 'num_layers': 3, 'dropout': 0.4, 'lr': 2e-3},
 }
 
-TRAD_GRIDS = {
-    'Logistic Regression': [
-        {'C': 0.01}, {'C': 0.1}, {'C': 1.0}, {'C': 10.0},
-    ],
-    'Random Forest': [
-        {'n_estimators': 100, 'max_depth': None},
-        {'n_estimators': 200, 'max_depth': None},
-        {'n_estimators': 200, 'max_depth': 12},
-        {'n_estimators': 300, 'max_depth': 12},
-        {'n_estimators': 300, 'max_depth': 20},
-    ],
-    'XGBoost': [
-        {'n_estimators': 100, 'max_depth': 3, 'learning_rate': 0.1},
-        {'n_estimators': 200, 'max_depth': 3, 'learning_rate': 0.1},
-        {'n_estimators': 100, 'max_depth': 6, 'learning_rate': 0.1},
-        {'n_estimators': 200, 'max_depth': 6, 'learning_rate': 0.1},
-        {'n_estimators': 300, 'max_depth': 3, 'learning_rate': 0.05},
-    ],
-    'LightGBM': [
-        {'n_estimators': 100, 'num_leaves': 31, 'learning_rate': 0.1},
-        {'n_estimators': 200, 'num_leaves': 31, 'learning_rate': 0.1},
-        {'n_estimators': 100, 'num_leaves': 63, 'learning_rate': 0.1},
-        {'n_estimators': 200, 'num_leaves': 63, 'learning_rate': 0.1},
-        {'n_estimators': 300, 'num_leaves': 31, 'learning_rate': 0.05},
-    ],
+TRAD_FIXED_PARAMS = {
+    'Logistic Regression': {'C': 1.0},
+    'Random Forest': {'n_estimators': 100, 'max_depth': None},
+    'XGBoost': {'n_estimators': 100, 'max_depth': 6, 'learning_rate': 0.1},
+    'LightGBM': {'n_estimators': 100, 'num_leaves': 31, 'learning_rate': 0.1},
 }
-if FAST_MODE:
-    DEEP_GRIDS = {k: v[:2] for k, v in DEEP_GRIDS.items()}
-    TRAD_GRIDS = {k: v[:2] for k, v in TRAD_GRIDS.items()}
 
 plt.rcParams.update({
     'font.family': ['sans-serif'],
@@ -443,7 +400,7 @@ def plot_cv_auc_bars(cv_summary, save_dir):
     for i, (m, s) in enumerate(zip(best_rows['mean_AUC'], best_rows['std_AUC'])):
         plt.text(m + s + 0.002, i, f'{m:.3f}±{s:.3f}', va='center', fontsize=10)
     plt.xlabel('5 折交叉验证 AUC（均值 ± 标准差）', fontweight='bold')
-    plt.title('各模型最优超参数的交叉验证性能', fontweight='bold', pad=15)
+    plt.title('各模型固定超参数的交叉验证性能', fontweight='bold', pad=15)
     plt.xlim(min(0.5, best_rows['mean_AUC'].min() - 0.05), 1.0)
     plt.grid(axis='x', alpha=0.3)
     plt.tight_layout()
@@ -825,71 +782,65 @@ def make_patient_folds(dev_df, n_folds=N_FOLDS, seed=CV_SEED):
     return folds
 
 def run_deep_cv(model_name, dev_df, folds, feature_dim, class_weights_full, num_workers):
-    grid = DEEP_GRIDS[model_name]
+    cfg = dict(DEEP_FIXED_PARAMS[model_name])
+    if model_name == 'REAL-CA':
+        cfg.update({'input_dim': N_DYNAMIC, 'static_dim': N_STATIC,
+                    'static_emb_dim': STATIC_EMB_DIM, 'output_dim': 2})
+    else:
+        cfg.update({'input_dim': len(ALL_RAW_FEATURES), 'output_dim': 2})
+
     max_epochs = CV_EPOCHS[model_name]
     patience = CV_PATIENCE[model_name]
     rows = []
-    cfg_results = []
-    oof_store = {} 
+    fold_aucs, fold_briers, fold_epochs = [], [], []
+    oof_parts = []
 
-    for ci, cfg in enumerate(grid):
-        cfg = dict(cfg)
-        if model_name == 'REAL-CA':
-            cfg.update({'input_dim': N_DYNAMIC, 'static_dim': N_STATIC,
-                        'static_emb_dim': STATIC_EMB_DIM, 'output_dim': 2})
-        else:
-            cfg.update({'input_dim': len(ALL_RAW_FEATURES), 'output_dim': 2})
-        fold_aucs, fold_briers, fold_epochs = [], [], []
-        oof_parts = []
-        for fi, (tr_pids, va_pids) in enumerate(folds):
-            print(f'\n--- [{model_name}] 配置{ci + 1}/{len(grid)} {cfg} | fold {fi + 1}/{N_FOLDS} ---')
-            tr_df = dev_df[dev_df[ID_COL].isin(tr_pids)]
-            va_df = dev_df[dev_df[ID_COL].isin(va_pids)]
-            cw = compute_class_weights(tr_df)
-            seed = CV_SEED + ci * 100 + fi
-            fit = fit_deep_model(model_name, tr_df, va_df, cfg, cw,
-                                 max_epochs=max_epochs, patience=patience,
-                                 seed=seed, num_workers=num_workers,
-                                 desc=f'{model_name}-c{ci + 1}-f{fi + 1}')
-            vp, vo, vy, vprob = fit['val_pred']
-            auc, brier = quick_auc_brier(vy, vprob)
-            fold_aucs.append(auc); fold_briers.append(brier); fold_epochs.append(fit['best_epoch'])
-            oof_parts.append(pd.DataFrame({ID_COL: vp, TIME_COL: vo,
-                                           'true_label': vy, 'pred_prob': vprob}))
-            rows.append({'Model': model_name, 'config_id': ci + 1, 'params': json.dumps(cfg, ensure_ascii=False),
-                         'fold': fi + 1, 'AUC': auc, 'Brier': brier, 'best_epoch': fit['best_epoch']})
-            print(f'   fold{fi + 1} AUC={auc:.4f} Brier={brier:.4f} best_epoch={fit["best_epoch"]}')
-        oof_store[ci + 1] = oof_parts
-        cfg_results.append({
-            'config_id': ci + 1, 'params': cfg,
-            'mean_AUC': float(np.mean(fold_aucs)), 'std_AUC': float(np.std(fold_aucs, ddof=0)),
-            'mean_Brier': float(np.mean(fold_briers)),
-            'median_best_epoch': int(np.ceil(np.median(fold_epochs))),
-        })
-        print(f'>>> [{model_name}] 配置{ci + 1} 5折 AUC={np.mean(fold_aucs):.4f}±{np.std(fold_aucs):.4f}')
+    for fi, (tr_pids, va_pids) in enumerate(folds):
+        print(f'\n--- [{model_name}] 第 {fi + 1}/{N_FOLDS} 折 | 固定参数: {cfg} ---')
+        tr_df = dev_df[dev_df[ID_COL].isin(tr_pids)]
+        va_df = dev_df[dev_df[ID_COL].isin(va_pids)]
+        cw = compute_class_weights(tr_df)
+        seed = CV_SEED + fi
+        fit = fit_deep_model(model_name, tr_df, va_df, cfg, cw,
+                             max_epochs=max_epochs, patience=patience,
+                             seed=seed, num_workers=num_workers,
+                             desc=f'{model_name}-fold{fi + 1}')
+        vp, vo, vy, vprob = fit['val_pred']
+        auc, brier = quick_auc_brier(vy, vprob)
+        fold_aucs.append(auc); fold_briers.append(brier); fold_epochs.append(fit['best_epoch'])
+        oof_parts.append(pd.DataFrame({ID_COL: vp, TIME_COL: vo,
+                                       'true_label': vy, 'pred_prob': vprob}))
+        rows.append({'Model': model_name, 'fold': fi + 1,
+                     'AUC': auc, 'Brier': brier, 'best_epoch': fit['best_epoch']})
+        print(f'   fold{fi + 1} AUC={auc:.4f} Brier={brier:.4f} best_epoch={fit["best_epoch"]}')
 
-    cfg_results.sort(key=lambda r: (-r['mean_AUC'], r['std_AUC'], r['mean_Brier']))
-    best = cfg_results[0]
-    print(f'🏆 [{model_name}] 最优配置: {best["params"]} '
-          f'(CV AUC={best["mean_AUC"]:.4f}±{best["std_AUC"]:.4f}, 中位数best_epoch={best["median_best_epoch"]})')
+    best = {
+        'params': cfg,
+        'mean_AUC': float(np.mean(fold_aucs)),
+        'std_AUC': float(np.std(fold_aucs, ddof=0)),
+        'mean_Brier': float(np.mean(fold_briers)),
+        'median_best_epoch': int(np.ceil(np.median(fold_epochs))),
+    }
+    print(f'[{model_name}] 五折 CV AUC={best["mean_AUC"]:.4f}±{best["std_AUC"]:.4f} '
+          f'(Brier={best["mean_Brier"]:.4f}，中位数 best_epoch={best["median_best_epoch"]})')
 
-    oof_df = pd.concat(oof_store[best['config_id']], ignore_index=True)
-    best_cfg = dict(best['params'])
+    oof_df = pd.concat(oof_parts, ignore_index=True)
 
     final_epochs = int(min(best['median_best_epoch'], FINAL_EPOCHS_CAP[model_name]))
-    print(f'\n=== [{model_name}] 全开发集重训，固定 {final_epochs} 轮（CV 中位数 best_epoch，封顶 {FINAL_EPOCHS_CAP[model_name]}）===')
-    final_fit = fit_deep_model(model_name, dev_df, None, best_cfg, class_weights_full,
+    print(f'\n=== [{model_name}] 全开发集重训，固定 {final_epochs} 轮'
+          f'（CV 中位数 best_epoch，封顶 {FINAL_EPOCHS_CAP[model_name]}）===')
+    final_fit = fit_deep_model(model_name, dev_df, None, cfg, class_weights_full,
                                max_epochs=final_epochs, patience=final_epochs,
                                seed=CV_SEED + 1000, num_workers=num_workers,
                                desc=f'{model_name}-final')
     torch.save({'model_state_dict': final_fit['best_state'],
-                'hyperparameters': best_cfg, 'feature_names': ALL_RAW_FEATURES,
+                'hyperparameters': cfg, 'feature_names': ALL_RAW_FEATURES,
                 'final_epochs': final_epochs, 'cv_auc_mean': best['mean_AUC'],
                 'cv_auc_std': best['std_AUC'],
                 'save_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')},
                os.path.join(model_dir, f'best_{model_name}_model.pth'))
 
-    return {'cv_rows': rows, 'all_configs': cfg_results, 'best': best,
+    return {'cv_rows': rows, 'best': best,
             'oof_df': oof_df, 'final_model': final_fit['model']}
 
 def get_traditional_feature_cols(df):
@@ -918,7 +869,7 @@ def make_traditional_estimator(name, cfg, w_pos):
 
 def run_traditional_cv(model_name, train_df, internal_df, external_df, folds,
                        feature_cols, class_weights_full):
-    grid = TRAD_GRIDS[model_name]
+    cfg = dict(TRAD_FIXED_PARAMS[model_name])
     w_pos_full = float(class_weights_full[1])
     X_tr = train_df[feature_cols].values
     y_tr = train_df[TARGET_COL].values
@@ -933,46 +884,38 @@ def run_traditional_cv(model_name, train_df, internal_df, external_df, folds,
         fold_weights.append(float(cw[1]))
 
     rows = []
-    cfg_results = []
-    oof_store = {} 
+    fold_aucs, fold_briers = [], []
+    oof_prob = np.full(len(train_df), np.nan)
 
-    for ci, cfg in enumerate(grid):
-        fold_aucs, fold_briers = [], []
-        oof_prob = np.full(len(train_df), np.nan)
-        for fi, ((tr_mask, va_mask), w_pos) in enumerate(zip(fold_masks, fold_weights)):
-            print(f'\n--- [{model_name}] 配置{ci + 1}/{len(grid)} {cfg} | fold {fi + 1}/{N_FOLDS} ---')
-            est = make_traditional_estimator(model_name, cfg, w_pos)
-            est.fit(X_tr[tr_mask], y_tr[tr_mask])
-            vprob = est.predict_proba(X_tr[va_mask])[:, 1]
-            oof_prob[va_mask] = vprob
-            vy = y_tr[va_mask]
-            auc, brier = quick_auc_brier(vy, vprob)
-            fold_aucs.append(auc); fold_briers.append(brier)
-            rows.append({'Model': model_name, 'config_id': ci + 1,
-                         'params': json.dumps(cfg, ensure_ascii=False), 'fold': fi + 1,
-                         'AUC': auc, 'Brier': brier, 'best_epoch': ''})
-            print(f'   fold{fi + 1} AUC={auc:.4f} Brier={brier:.4f}')
-        oof_store[ci + 1] = oof_prob
-        cfg_results.append({'config_id': ci + 1, 'params': dict(cfg),
-                            'mean_AUC': float(np.mean(fold_aucs)),
-                            'std_AUC': float(np.std(fold_aucs, ddof=0)),
-                            'mean_Brier': float(np.mean(fold_briers)),
-                            'median_best_epoch': ''})
-        print(f'>>> [{model_name}] 配置{ci + 1} 5折 AUC={np.mean(fold_aucs):.4f}±{np.std(fold_aucs):.4f}')
+    for fi, ((tr_mask, va_mask), w_pos) in enumerate(zip(fold_masks, fold_weights)):
+        print(f'\n--- [{model_name}] 第 {fi + 1}/{N_FOLDS} 折 | 固定参数: {cfg} ---')
+        est = make_traditional_estimator(model_name, cfg, w_pos)
+        est.fit(X_tr[tr_mask], y_tr[tr_mask])
+        vprob = est.predict_proba(X_tr[va_mask])[:, 1]
+        oof_prob[va_mask] = vprob
+        vy = y_tr[va_mask]
+        auc, brier = quick_auc_brier(vy, vprob)
+        fold_aucs.append(auc); fold_briers.append(brier)
+        rows.append({'Model': model_name, 'fold': fi + 1,
+                     'AUC': auc, 'Brier': brier, 'best_epoch': ''})
+        print(f'   fold{fi + 1} AUC={auc:.4f} Brier={brier:.4f}')
 
-    cfg_results.sort(key=lambda r: (-r['mean_AUC'], r['std_AUC'], r['mean_Brier']))
-    best = cfg_results[0]
-    print(f'🏆 [{model_name}] 最优配置: {best["params"]} '
-          f'(CV AUC={best["mean_AUC"]:.4f}±{best["std_AUC"]:.4f})')
+    best = {
+        'params': cfg,
+        'mean_AUC': float(np.mean(fold_aucs)),
+        'std_AUC': float(np.std(fold_aucs, ddof=0)),
+        'mean_Brier': float(np.mean(fold_briers)),
+        'median_best_epoch': '',
+    }
+    print(f'[{model_name}] 五折 CV AUC={best["mean_AUC"]:.4f}±{best["std_AUC"]:.4f}')
 
-    best_cfg = dict(best['params'])
     oof_df = pd.DataFrame({ID_COL: pids_tr, TIME_COL: train_df[TIME_COL].values,
-                           'true_label': y_tr, 'pred_prob': oof_store[best['config_id']]})
+                           'true_label': y_tr, 'pred_prob': oof_prob})
 
     print(f'\n=== [{model_name}] 全训练集重训 ===')
-    final_est = make_traditional_estimator(model_name, best_cfg, w_pos_full)
+    final_est = make_traditional_estimator(model_name, cfg, w_pos_full)
     final_est.fit(X_tr, y_tr)
-    joblib.dump({'model': final_est, 'params': best_cfg, 'feature_cols': feature_cols,
+    joblib.dump({'model': final_est, 'params': cfg, 'feature_cols': feature_cols,
                  'cv_auc_mean': best['mean_AUC'], 'cv_auc_std': best['std_AUC'],
                  'save_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')},
                 os.path.join(model_dir, f'best_{model_name}_model.pkl'))
@@ -984,7 +927,7 @@ def run_traditional_cv(model_name, train_df, internal_df, external_df, folds,
 
     internal_pred = _to_pred(internal_df)
     external_pred = _to_pred(external_df)
-    return {'cv_rows': rows, 'all_configs': cfg_results, 'best': best,
+    return {'cv_rows': rows, 'best': best,
             'oof_df': oof_df, 'internal_df': internal_pred,
             'external_df': external_pred, 'final_model': final_est}
 
@@ -1060,15 +1003,15 @@ def main():
     cv_detail.to_csv(cv_detail_path, index=False)
     print(f'\n✅ CV 折明细已保存: {cv_detail_path}')
 
-    best_df = pd.DataFrame(all_best)
-    best_df_path = os.path.join(cv_dir, 'cv_best_hyperparams.csv')
-    best_df.to_csv(best_df_path, index=False)
-    print(f'✅ 最优超参数已保存: {best_df_path}')
-    best_json = {r['Model']: {k: (v if not isinstance(v, np.generic) else v.item())
-                              for k, v in json.loads(r['params']).items()}
-                 for r in all_best}
-    with open(os.path.join(cv_dir, 'best_hyperparams.json'), 'w', encoding='utf-8') as f:
-        json.dump(best_json, f, ensure_ascii=False, indent=2)
+    summary_df = pd.DataFrame(all_best)
+    summary_path = os.path.join(cv_dir, 'cv_summary.csv')
+    summary_df.to_csv(summary_path, index=False)
+    print(f'\u2705 五折 CV 汇总（固定超参数）已保存: {summary_path}')
+    fixed_json = {r['Model']: {k: (v if not isinstance(v, np.generic) else v.item())
+                               for k, v in json.loads(r['params']).items()}
+                  for r in all_best}
+    with open(os.path.join(cv_dir, 'fixed_hyperparams.json'), 'w', encoding='utf-8') as f:
+        json.dump(fixed_json, f, ensure_ascii=False, indent=2)
 
     if RUN_DEEP_MODELS:
         for model_name in ['REAL-CA', 'LSTM', 'MLP']:
@@ -1166,7 +1109,7 @@ def main():
         plot_roc_curves(pdata, dname, curve_dir)
         plot_calibration_curves(pdata, dname, calibration_dir)
         plot_decision_curves(pdata, dname, curve_dir)
-    plot_cv_auc_bars(best_df, cv_dir)
+    plot_cv_auc_bars(summary_df, cv_dir)
 
     env_info = {
         'run_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
@@ -1190,7 +1133,7 @@ def main():
         'n_bootstrap_ci': N_BOOTSTRAP,
         'delong_test': 'paired DeLong, REAL-CA vs each comparator on internal/external',
         'data_dir': preprocessed_dir,
-        'best_hyperparams': best_json,
+        'fixed_hyperparams': fixed_json,
     }
     with open(os.path.join(output_dir, 'environment_info.json'), 'w', encoding='utf-8') as f:
         json.dump(env_info, f, ensure_ascii=False, indent=2)
